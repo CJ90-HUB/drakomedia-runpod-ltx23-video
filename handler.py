@@ -26,7 +26,6 @@ SPATIAL_UPSAMPLER = (
     "/models/ltx-2.3/"
     "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
 )
-GEMMA_ROOT = "/models/gemma-3-12b"
 _session = requests.Session()
 
 
@@ -55,6 +54,34 @@ def _locate_checkpoint() -> Path:
             return matches[0]
     raise RuntimeError(
         "El modelo LTX-2.3 FP8 no está disponible en la caché de RunPod."
+    )
+
+
+def _locate_gemma() -> Path:
+    configured = os.environ.get("LTX_GEMMA_ROOT", "").strip()
+    if configured and (Path(configured) / "config.json").is_file():
+        return Path(configured)
+    candidates = [
+        Path("/models/gemma-3-12b"),
+        Path(
+            "/runpod-volume/huggingface-cache/hub/"
+            "models--Lightricks--gemma-3-12b-it-qat-q4_0-unquantized"
+        ),
+        Path(
+            "/runpod-volume/huggingface-cache/"
+            "models--Lightricks--gemma-3-12b-it-qat-q4_0-unquantized"
+        ),
+    ]
+    for candidate in candidates:
+        if (candidate / "config.json").is_file():
+            return candidate
+        snapshots = candidate / "snapshots"
+        if snapshots.is_dir():
+            for snapshot in snapshots.iterdir():
+                if (snapshot / "config.json").is_file():
+                    return snapshot
+    raise RuntimeError(
+        "Gemma 3 no está disponible en la caché de modelos de RunPod."
     )
 
 
@@ -112,6 +139,7 @@ def _upload(url: str, source: Path) -> str:
 
 def _run_pipeline(request: VideoRequest, folder: Path) -> Path:
     checkpoint = _locate_checkpoint()
+    gemma_root = _locate_gemma()
     output = folder / "result.mp4"
     command = [
         "python",
@@ -122,7 +150,7 @@ def _run_pipeline(request: VideoRequest, folder: Path) -> Path:
         "--spatial-upsampler-path",
         SPATIAL_UPSAMPLER,
         "--gemma-root",
-        GEMMA_ROOT,
+        str(gemma_root),
         "--seed",
         str(request.seed),
         "--output-path",
