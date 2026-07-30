@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import gc
 import hashlib
+import json
 import os
+import re
 import tempfile
 import threading
 import time
@@ -10,11 +12,14 @@ from pathlib import Path
 from typing import Any
 
 import requests
+from PIL import Image
 
 from contract import (
     MAX_IMAGE_BYTES,
     MAX_OUTPUT_BYTES,
+    MotionAnalysisRequest,
     VideoRequest,
+    parse_motion_request,
     parse_request,
     public_error,
 )
@@ -33,6 +38,29 @@ _pipeline_load_seconds = 0.0
 _pipeline_generation_count = 0
 _pipeline_lock = threading.Lock()
 _generation_lock = threading.Lock()
+
+MOTION_SYSTEM_PROMPT = """
+You are a conservative motion director for LTX-2.3 image-to-video.
+Inspect the actual supplied image and the scene context. Return ONLY one
+compact JSON object:
+{"motion_prompt":"...","confidence":0.0,"risk":"low|medium|high","reason":"..."}
+
+motion_prompt must contain 20-55 English words and describe one continuous
+documentary shot. State one restrained camera behavior and only physically
+plausible motion of elements visibly present in the image. Never introduce,
+remove, duplicate or transform subjects or objects. Never request a scene
+transition, a hidden area, a new action, readable text, fast camera motion,
+camera roll, aggressive zoom, morphing or complex choreography. Preserve
+identity, subject count, geometry and composition. For people in close or
+medium shots, prefer a locked camera with breathing, blinking and tiny
+existing gestures. confidence measures how certain you are that the motion
+matches visible content. risk is high when faces, hands, dense machinery,
+text or ambiguous geometry make animation fragile. reason must be a short
+Spanish explanation. Motion level: safe means locked or nearly imperceptible;
+natural means one subtle documentary camera move and plausible visible
+motion; dynamic means one visible but controlled camera move and stronger
+existing environmental motion, without inventing actions or elements.
+""".strip()
 
 
 def _locate_checkpoint() -> Path:
@@ -180,6 +208,195 @@ def _load_pipeline() -> Any:
         return _pipeline
 
 
+def _unload_pipeline() -> None:
+    global _pipeline
+    if _pipeline is None:
+        return
+    pipeline = _pipeline
+    _pipeline = None
+    del pipeline
+    gc.collect()
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _extract_motion_object(text: str) -> dict[str, Any]:
+    cleaned = re.sub(
+        r"^```(?:json)?\s*|\s*```$",
+        "",
+        text.strip(),
+        flags=re.I | re.S,
+    )
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start < 0 or end <= start:
+        raise ValueError("El director visual no devolvió JSON.")
+    return json.loads(cleaned[start : end + 1])
+
+
+def _validate_motion(value: dict[str, Any]) -> dict[str, Any]:
+    prompt = " ".join(str(value.get("motion_prompt", "")).split())
+    words = prompt.split()
+    forbidden = (
+        "new person",
+        "new people",
+        "new object",
+        "scene transition",
+        "camera roll",
+        "fast pan",
+        "fast tilt",
+        "aggressive zoom",
+        "morph",
+        "transform into",
+    )
+    if (
+        len(words) < 12
+        or len(words) > 80
+        or any(term in prompt.lower() for term in forbidden)
+    ):
+        raise ValueError("El prompt de movimiento no superó la validación.")
+    confidence = max(
+        0.0,
+        min(1.0, float(value.get("confidence", 0.0))),
+    )
+    risk = str(value.get("risk", "high")).strip().lower()
+    if risk not in {"low", "medium", "high"}:
+        risk = "high"
+    return {
+        "motion_prompt": prompt,
+        "confidence": confidence,
+        "risk": risk,
+        "reason": " ".join(
+            str(value.get("reason", "")).split()
+        )[:240],
+    }
+
+
+def _motion_context(scene: Any) -> str:
+    return (
+        f"{MOTION_SYSTEM_PROMPT}\n\n"
+        f"Scene title: {scene.title}\n"
+        f"Narration: {scene.narration}\n"
+        f"Image prompt: {scene.image_prompt}\n"
+        f"Visual intention: {scene.visual_intent}\n"
+        f"Motion level: {scene.level}"
+    )
+
+
+def _prepare_motion_image(path: Path) -> Image.Image:
+    with Image.open(path) as source:
+        image = source.convert("RGB")
+    image.thumbnail((768, 768), Image.Resampling.LANCZOS)
+    return image
+
+
+def _analyze_motion(
+    request: MotionAnalysisRequest,
+    folder: Path,
+) -> dict[str, Any]:
+    import torch
+    from transformers import AutoModelForImageTextToText, AutoProcessor
+
+    _unload_pipeline()
+    model_root = str(_locate_gemma())
+    print(
+        "DrakoMedia Cloud Motion · cargando el director visual Gemma 3",
+        flush=True,
+    )
+    started = time.monotonic()
+    processor = AutoProcessor.from_pretrained(
+        model_root,
+        local_files_only=True,
+    )
+    model = AutoModelForImageTextToText.from_pretrained(
+        model_root,
+        torch_dtype=torch.bfloat16,
+        local_files_only=True,
+        low_cpu_mem_usage=True,
+    ).to("cuda").eval()
+    load_seconds = time.monotonic() - started
+    results: list[dict[str, Any]] = []
+    analysis_started = time.monotonic()
+    try:
+        for index, scene in enumerate(request.scenes, start=1):
+            image_path = folder / f"motion-{index:03d}.image"
+            _download_image(scene.image_url, image_path)
+            image = _prepare_motion_image(image_path)
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "image": image},
+                        {"type": "text", "text": _motion_context(scene)},
+                    ],
+                }
+            ]
+            prompt = processor.apply_chat_template(
+                messages,
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+            inputs = processor(
+                text=[prompt],
+                images=[image],
+                return_tensors="pt",
+            ).to("cuda")
+            with torch.inference_mode():
+                generated = model.generate(
+                    **inputs,
+                    max_new_tokens=180,
+                    do_sample=False,
+                )
+            trimmed = generated[:, inputs["input_ids"].shape[-1] :]
+            raw = processor.batch_decode(
+                trimmed,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )[0]
+            result = _validate_motion(_extract_motion_object(raw))
+            result.update(
+                {
+                    "scene_id": scene.scene_id,
+                    "analysis_signature": scene.analysis_signature,
+                    "ok": True,
+                }
+            )
+            results.append(result)
+            print(
+                "DrakoMedia Cloud Motion · "
+                f"analizada {index} de {len(request.scenes)}",
+                flush=True,
+            )
+            del inputs
+            del generated
+            del trimmed
+            image.close()
+            image_path.unlink(missing_ok=True)
+    finally:
+        del model
+        del processor
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    return {
+        "ok": True,
+        "request_id": request.request_id,
+        "operation": "analyze_motion",
+        "results": results,
+        "director_engine": "gemma-3-12b-vision",
+        "director_mode": "cloud-batch",
+        "model_load_ms": round(load_seconds * 1_000),
+        "analysis_ms": round(
+            (time.monotonic() - analysis_started) * 1_000
+        ),
+        "scene_count": len(results),
+    }
 def _run_pipeline(request: VideoRequest, folder: Path) -> tuple[Path, float, bool]:
     global _pipeline_generation_count
 
@@ -275,6 +492,27 @@ def _generate(request: VideoRequest, folder: Path) -> dict[str, Any]:
 
 def handler(event: dict[str, Any]) -> dict[str, Any]:
     try:
+        payload = event.get("input") if isinstance(event, dict) else None
+        operation = (
+            payload.get("operation", "generate_video")
+            if isinstance(payload, dict)
+            else "generate_video"
+        )
+        if operation == "analyze_motion":
+            motion_request = parse_motion_request(event)
+            print(
+                "DrakoMedia Cloud Motion · "
+                f"solicitud {motion_request.request_id} · "
+                f"{len(motion_request.scenes)} imágenes",
+                flush=True,
+            )
+            with tempfile.TemporaryDirectory(
+                prefix="drakomedia-motion-"
+            ) as name:
+                return _analyze_motion(
+                    motion_request,
+                    Path(name),
+                )
         request = parse_request(event)
         print(
             "DrakoMedia LTX-2.3 · "
@@ -302,5 +540,4 @@ if __name__ == "__main__":
         "PYTORCH_CUDA_ALLOC_CONF",
         "expandable_segments:True",
     )
-    _load_pipeline()
     runpod.serverless.start({"handler": handler})

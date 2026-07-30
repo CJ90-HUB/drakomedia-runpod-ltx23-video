@@ -3,7 +3,7 @@ import unittest
 
 os.environ["DRAKO_SKIP_DNS_GUARD"] = "1"
 
-from contract import ContractError, parse_request
+from contract import ContractError, parse_motion_request, parse_request
 
 
 HOST = (
@@ -58,6 +58,35 @@ class ContractTests(unittest.TestCase):
         bad["input"]["output"]["object_key"] = "video/result.mp4"
         with self.assertRaises(ContractError):
             parse_request(bad)
+
+    def test_valid_motion_request(self):
+        request = parse_motion_request({
+            "input": {
+                "operation": "analyze_motion",
+                "request_id": "motion-1",
+                "scenes": [{
+                    "scene_id": "scene-1",
+                    "analysis_signature": "A" * 64,
+                    "image_url": f"https://{HOST}/source.png",
+                    "title": "Scene",
+                    "narration": "Narration",
+                    "image_prompt": "Prompt",
+                    "visual_intent": "Intent",
+                    "level": "natural",
+                }],
+            }
+        })
+        self.assertEqual(request.scenes[0].scene_id, "scene-1")
+
+    def test_rejects_motion_without_scenes(self):
+        with self.assertRaises(ContractError):
+            parse_motion_request({
+                "input": {
+                    "operation": "analyze_motion",
+                    "request_id": "motion-1",
+                    "scenes": [],
+                }
+            })
 
 
 if __name__ == "__main__":
