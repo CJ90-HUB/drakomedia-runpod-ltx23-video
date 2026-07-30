@@ -7,6 +7,10 @@ Worker privado de vídeo para DrakoMedia Studio Pro Cloud.
 - Pipeline oficial `DistilledPipeline` de Lightricks.
 - Checkpoint oficial FP8 destilado, fijado por revisión.
 - Ocho pasos en la primera etapa y cuatro en el refinado.
+- El modelo se carga una sola vez al arrancar el worker y permanece residente
+  en GPU durante toda la tanda; no se abre un proceso Python por escena.
+- Las escenas se procesan en serie sobre la misma tubería y cada resultado se
+  sube a R2 inmediatamente al terminar.
 - El checkpoint grande se sirve desde la caché de modelos de RunPod.
 - Gemma 3 QAT queda fijado e incluido en la imagen del worker.
 - El upscaler oficial está fijado dentro de la imagen.

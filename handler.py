@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import gc
 import hashlib
 import os
-import subprocess
 import tempfile
-from collections import deque
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,11 @@ SPATIAL_UPSAMPLER = (
     "ltx-2.3-spatial-upscaler-x2-1.1.safetensors"
 )
 _session = requests.Session()
+_pipeline: Any | None = None
+_pipeline_load_seconds = 0.0
+_pipeline_generation_count = 0
+_pipeline_lock = threading.Lock()
+_generation_lock = threading.Lock()
 
 
 def _locate_checkpoint() -> Path:
@@ -137,71 +143,110 @@ def _upload(url: str, source: Path) -> str:
     return digest
 
 
-def _run_pipeline(request: VideoRequest, folder: Path) -> Path:
-    checkpoint = _locate_checkpoint()
-    gemma_root = _locate_gemma()
+def _load_pipeline() -> Any:
+    global _pipeline
+    global _pipeline_load_seconds
+
+    if _pipeline is not None:
+        return _pipeline
+    with _pipeline_lock:
+        if _pipeline is not None:
+            return _pipeline
+
+        from ltx_pipelines.distilled import DistilledPipeline
+        from ltx_pipelines.utils.quantization_factory import QuantizationKind
+
+        checkpoint = str(_locate_checkpoint())
+        started = time.monotonic()
+        print(
+            "DrakoMedia LTX-2.3 · cargando el modelo persistente una sola vez",
+            flush=True,
+        )
+        _pipeline = DistilledPipeline(
+            distilled_checkpoint_path=checkpoint,
+            spatial_upsampler_path=SPATIAL_UPSAMPLER,
+            gemma_root=str(_locate_gemma()),
+            loras=(),
+            quantization=QuantizationKind.FP8_SCALED_MM.to_policy(
+                checkpoint_path=checkpoint
+            ),
+        )
+        _pipeline_load_seconds = time.monotonic() - started
+        print(
+            "DrakoMedia LTX-2.3 · modelo persistente preparado en "
+            f"{_pipeline_load_seconds:.1f} s",
+            flush=True,
+        )
+        return _pipeline
+
+
+def _run_pipeline(request: VideoRequest, folder: Path) -> tuple[Path, float, bool]:
+    global _pipeline_generation_count
+
+    import torch
+    from ltx_core.model.video_vae import (
+        TilingConfig,
+        get_video_chunks_number,
+    )
+    from ltx_pipelines.utils.args import ImageConditioningInput
+    from ltx_pipelines.utils.media_io import encode_video
+
+    reused = _pipeline is not None
+    pipeline = _load_pipeline()
     output = folder / "result.mp4"
-    command = [
-        "python",
-        "-m",
-        "ltx_pipelines.distilled",
-        "--distilled-checkpoint-path",
-        str(checkpoint),
-        "--spatial-upsampler-path",
-        SPATIAL_UPSAMPLER,
-        "--gemma-root",
-        str(gemma_root),
-        "--seed",
-        str(request.seed),
-        "--output-path",
-        str(output),
-        "--prompt",
-        request.prompt,
-        "--height",
-        str(request.height),
-        "--width",
-        str(request.width),
-        "--num-frames",
-        str(request.frames),
-        "--frame-rate",
-        str(request.fps),
-        "--quantization",
-        "fp8-scaled-mm",
-    ]
+    images = []
     if request.image_url:
         image = folder / "source-image"
         _download_image(request.image_url, image)
-        command.extend(["--image", str(image), "0", "0.95", "0"])
-
-    tail: deque[str] = deque(maxlen=40)
-    environment = os.environ.copy()
-    environment["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-    process = subprocess.Popen(
-        command,
-        cwd="/opt/ltx",
-        env=environment,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-    )
-    assert process.stdout is not None
-    for line in process.stdout:
-        cleaned = line.rstrip()
-        if cleaned:
-            print(cleaned, flush=True)
-            tail.append(cleaned)
-    return_code = process.wait()
-    if return_code != 0 or not output.is_file():
-        detail = " | ".join(tail)[-2_000:]
-        raise RuntimeError(
-            f"LTX-2.3 terminó con código {return_code}. {detail}"
+        images.append(
+            ImageConditioningInput(
+                path=str(image),
+                frame_idx=0,
+                strength=0.95,
+                crf=0,
+            )
         )
-    return output
+
+    started = time.monotonic()
+    with _generation_lock, torch.inference_mode():
+        tiling = TilingConfig.default()
+        video_chunks = get_video_chunks_number(request.frames, tiling)
+        video, audio = pipeline(
+            prompt=request.prompt,
+            seed=request.seed,
+            height=request.height,
+            width=request.width,
+            num_frames=request.frames,
+            frame_rate=request.fps,
+            images=images,
+            tiling_config=tiling,
+            enhance_prompt=False,
+        )
+        encode_video(
+            video=video,
+            fps=request.fps,
+            audio=audio,
+            output_path=str(output),
+            video_chunks_number=video_chunks,
+        )
+        del video
+        del audio
+
+    generation_seconds = time.monotonic() - started
+    _pipeline_generation_count += 1
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    if not output.is_file():
+        raise RuntimeError("LTX-2.3 no produjo el archivo de vídeo.")
+    return output, generation_seconds, reused
 
 
 def _generate(request: VideoRequest, folder: Path) -> dict[str, Any]:
-    output = _run_pipeline(request, folder)
+    output, generation_seconds, pipeline_reused = _run_pipeline(
+        request,
+        folder,
+    )
     sha256 = _upload(request.upload_url, output)
     return {
         "ok": True,
@@ -218,6 +263,11 @@ def _generate(request: VideoRequest, folder: Path) -> dict[str, Any]:
         ),
         "seed": request.seed,
         "engine": "ltx-2.3-distilled-fp8",
+        "pipeline_mode": "persistent",
+        "pipeline_reused": pipeline_reused,
+        "pipeline_load_ms": round(_pipeline_load_seconds * 1_000),
+        "generation_ms": round(generation_seconds * 1_000),
+        "generation_count": _pipeline_generation_count,
         "code_revision": LTX_CODE_REVISION,
         "model_revision": LTX_MODEL_REVISION,
     }
@@ -248,4 +298,9 @@ def handler(event: dict[str, Any]) -> dict[str, Any]:
 if __name__ == "__main__":
     import runpod
 
+    os.environ.setdefault(
+        "PYTORCH_CUDA_ALLOC_CONF",
+        "expandable_segments:True",
+    )
+    _load_pipeline()
     runpod.serverless.start({"handler": handler})
