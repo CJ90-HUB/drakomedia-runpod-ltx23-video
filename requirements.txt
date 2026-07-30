@@ -1,3 +1,4 @@
 runpod==1.7.12
 requests==2.32.5
-huggingface-hub>=0.34.4
+transformers==4.57.6
+huggingface-hub==0.36.0
