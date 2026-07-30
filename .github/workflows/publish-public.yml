@@ -37,5 +37,3 @@ jobs:
           tags: |
             ghcr.io/cj90-hub/drakomedia-ltx23-video-public:latest
             ghcr.io/cj90-hub/drakomedia-ltx23-video-public:${{ github.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
