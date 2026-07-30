@@ -28,12 +28,20 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: imjasonh/setup-crane@v0.4
 
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: |
-            ghcr.io/cj90-hub/drakomedia-ltx23-video-public:latest
-            ghcr.io/cj90-hub/drakomedia-ltx23-video-public:${{ github.sha }}
+      - name: Create worker patch layer
+        run: |
+          tar -czf /tmp/worker-patch.tgz \
+            --transform='s,^,app/,' \
+            handler.py contract.py
+
+      - name: Publish immutable worker patch
+        env:
+          BASE_IMAGE: ghcr.io/cj90-hub/drakomedia-ltx23-video-public@sha256:05506e48ed5d3602bbcb02f3e0f8d0b566082b29724b1585c3ff602d0f596ed7
+          TARGET_IMAGE: ghcr.io/cj90-hub/drakomedia-ltx23-video-public
+        run: |
+          crane mutate "$BASE_IMAGE" \
+            --append /tmp/worker-patch.tgz \
+            --tag "$TARGET_IMAGE:${GITHUB_SHA}"
+          crane tag "$TARGET_IMAGE:${GITHUB_SHA}" latest
