@@ -27,6 +27,10 @@ RUN python -m pip install -r requirements.txt \
     && HF_HUB_OFFLINE=0 python download_models.py \
     && rm download_models.py
 
+RUN python -m pip install \
+        transformers==4.57.6 \
+        huggingface-hub==0.36.0
+
 COPY handler.py contract.py ./
 
 CMD ["python", "-u", "handler.py"]
