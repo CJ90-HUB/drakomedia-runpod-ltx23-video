@@ -58,6 +58,27 @@ class MotionHandlerTests(unittest.TestCase):
                 )
                 self.assertTrue(motion_handler._gemma_is_ready(root))
 
+    def test_prepare_model_returns_verified_size(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            (root / "weights.bin").write_bytes(b"verified-model")
+            with patch.object(
+                motion_handler,
+                "_ensure_gemma",
+                return_value=root,
+            ):
+                output = motion_handler.handler(
+                    {
+                        "input": {
+                            "operation": "prepare_model",
+                            "request_id": "prepare-test",
+                        }
+                    }
+                )
+        self.assertTrue(output["ok"])
+        self.assertEqual(output["operation"], "prepare_model")
+        self.assertEqual(output["model_bytes"], 14)
+
 
 if __name__ == "__main__":
     unittest.main()

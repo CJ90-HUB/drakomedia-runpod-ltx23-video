@@ -327,6 +327,32 @@ def _analyze_motion(
 
 def handler(event: dict[str, Any]) -> dict[str, Any]:
     try:
+        payload = event.get("input") if isinstance(event, dict) else None
+        if (
+            isinstance(payload, dict)
+            and payload.get("operation") == "prepare_model"
+        ):
+            request_id = str(payload.get("request_id", "")).strip()
+            if not request_id or len(request_id) > 160:
+                raise ValueError("Falta request_id para preparar Gemma 3.")
+            started = time.monotonic()
+            root = _ensure_gemma()
+            model_bytes = sum(
+                path.stat().st_size
+                for path in root.rglob("*")
+                if path.is_file()
+            )
+            return {
+                "ok": True,
+                "request_id": request_id,
+                "operation": "prepare_model",
+                "director_engine": "gemma-3-12b-vision",
+                "model_revision": GEMMA_REVISION,
+                "model_bytes": model_bytes,
+                "prepare_ms": round(
+                    (time.monotonic() - started) * 1_000
+                ),
+            }
         request = parse_motion_request(event)
         print(
             "DrakoMedia Cloud Motion · "
