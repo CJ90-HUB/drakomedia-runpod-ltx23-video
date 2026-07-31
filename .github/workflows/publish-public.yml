@@ -1,4 +1,4 @@
-name: Publish public LTX worker
+name: Publish split Cloud workers
 
 on:
   workflow_dispatch:
@@ -6,10 +6,13 @@ on:
     branches: [main]
     paths:
       - Dockerfile
+      - Dockerfile.motion
       - handler.py
+      - motion_handler.py
       - contract.py
       - download_models.py
       - requirements.txt
+      - requirements.motion.txt
       - .github/workflows/publish-public.yml
 
 permissions:
@@ -28,20 +31,28 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: imjasonh/setup-crane@v0.4
+      - uses: docker/setup-buildx-action@v3
 
-      - name: Create worker patch layer
-        run: |
-          tar -czf /tmp/worker-patch.tgz \
-            --transform='s,^,app/,' \
-            handler.py contract.py
+      - name: Publish lightweight LTX worker
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: |
+            ghcr.io/cj90-hub/drakomedia-ltx23-video-public:video-${{ github.sha }}
+            ghcr.io/cj90-hub/drakomedia-ltx23-video-public:video-latest
+          cache-from: type=gha,scope=ltx-video
+          cache-to: type=gha,mode=max,scope=ltx-video
 
-      - name: Publish immutable worker patch
-        env:
-          BASE_IMAGE: ghcr.io/cj90-hub/drakomedia-ltx23-video-public@sha256:05506e48ed5d3602bbcb02f3e0f8d0b566082b29724b1585c3ff602d0f596ed7
-          TARGET_IMAGE: ghcr.io/cj90-hub/drakomedia-ltx23-video-public
-        run: |
-          crane mutate "$BASE_IMAGE" \
-            --append /tmp/worker-patch.tgz \
-            --tag "$TARGET_IMAGE:${GITHUB_SHA}"
-          crane tag "$TARGET_IMAGE:${GITHUB_SHA}" latest
+      - name: Publish lightweight Gemma motion director
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.motion
+          push: true
+          tags: |
+            ghcr.io/cj90-hub/drakomedia-ltx23-video-public:motion-${{ github.sha }}
+            ghcr.io/cj90-hub/drakomedia-ltx23-video-public:motion-latest
+          cache-from: type=gha,scope=gemma-motion
+          cache-to: type=gha,mode=max,scope=gemma-motion

@@ -1,0 +1,7 @@
+runpod==1.7.12
+requests==2.32.5
+pillow==11.3.0
+transformers==4.57.6
+huggingface-hub==0.36.0
+accelerate==1.10.1
+safetensors==0.6.2

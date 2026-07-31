@@ -97,6 +97,7 @@ def _locate_gemma() -> Path:
         return Path(configured)
     candidates = [
         Path("/models/gemma-3-12b"),
+        Path("/runpod-volume/gemma-3-12b"),
         Path(
             "/runpod-volume/huggingface-cache/hub/"
             "models--Lightricks--gemma-3-12b-it-qat-q4_0-unquantized"
