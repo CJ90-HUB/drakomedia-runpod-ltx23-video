@@ -205,25 +205,51 @@ def _generate_result(
     image: Image.Image,
     context: str,
 ) -> dict[str, Any]:
+    return _generate_results(
+        model,
+        processor,
+        [image],
+        [context],
+    )[0]
+
+
+def _generate_results(
+    model: Any,
+    processor: Any,
+    images: list[Image.Image],
+    contexts: list[str],
+) -> list[dict[str, Any]]:
     import torch
 
+    if not images or len(images) != len(contexts):
+        raise ValueError("El lote visual no es válido.")
     messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": image},
-                {"type": "text", "text": context},
-            ],
-        }
+        [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "text", "text": context},
+                ],
+            }
+        ]
+        for image, context in zip(images, contexts, strict=True)
     ]
-    prompt = processor.apply_chat_template(
-        messages,
-        add_generation_prompt=True,
-        tokenize=False,
-    )
+    prompts = [
+        processor.apply_chat_template(
+            message,
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+        for message in messages
+    ]
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is not None:
+        tokenizer.padding_side = "left"
     inputs = processor(
-        text=[prompt],
-        images=[image],
+        text=prompts,
+        images=images,
+        padding=True,
         return_tensors="pt",
     ).to("cuda")
     generated = None
@@ -232,16 +258,21 @@ def _generate_result(
         with torch.inference_mode():
             generated = model.generate(
                 **inputs,
-                max_new_tokens=180,
+                max_new_tokens=112,
                 do_sample=False,
             )
-        trimmed = generated[:, inputs["input_ids"].shape[-1] :]
-        raw = processor.batch_decode(
+        trimmed = generated[:, inputs["input_ids"].shape[1] :]
+        raw_values = processor.batch_decode(
             trimmed,
             skip_special_tokens=True,
             clean_up_tokenization_spaces=False,
-        )[0]
-        return _validate_motion(_extract_motion_object(raw))
+        )
+        results: list[dict[str, Any]] = []
+        for raw in raw_values:
+            results.append(
+                _validate_motion(_extract_motion_object(raw))
+            )
+        return results
     finally:
         del inputs
         del generated
@@ -274,32 +305,50 @@ def _analyze_motion(
     load_seconds = time.monotonic() - started
     results: list[dict[str, Any]] = []
     analysis_started = time.monotonic()
+    batch_size = max(
+        1,
+        min(24, int(os.environ.get("DRAKO_MOTION_BATCH_SIZE", "16"))),
+    )
     try:
-        for index, scene in enumerate(request.scenes, start=1):
-            image_path = folder / f"motion-{index:03d}.image"
-            _download_image(scene.image_url, image_path)
-            image = _prepare_motion_image(image_path)
+        for batch_start in range(0, len(request.scenes), batch_size):
+            scenes = request.scenes[batch_start : batch_start + batch_size]
+            paths: list[Path] = []
+            images: list[Image.Image] = []
             try:
-                result = _generate_result(
+                for offset, scene in enumerate(scenes):
+                    index = batch_start + offset + 1
+                    image_path = folder / f"motion-{index:03d}.image"
+                    _download_image(scene.image_url, image_path)
+                    paths.append(image_path)
+                    images.append(_prepare_motion_image(image_path))
+                batch_results = _generate_results(
                     model,
                     processor,
-                    image,
-                    _motion_context(scene),
+                    images,
+                    [_motion_context(scene) for scene in scenes],
                 )
             finally:
-                image.close()
-                image_path.unlink(missing_ok=True)
-            result.update(
-                {
-                    "scene_id": scene.scene_id,
-                    "analysis_signature": scene.analysis_signature,
-                    "ok": True,
-                }
-            )
-            results.append(result)
+                for image in images:
+                    image.close()
+                for image_path in paths:
+                    image_path.unlink(missing_ok=True)
+            for scene, result in zip(
+                scenes,
+                batch_results,
+                strict=True,
+            ):
+                result.update(
+                    {
+                        "scene_id": scene.scene_id,
+                        "analysis_signature": scene.analysis_signature,
+                        "ok": True,
+                    }
+                )
+                results.append(result)
             print(
                 "DrakoMedia Cloud Motion · "
-                f"analizada {index} de {len(request.scenes)}",
+                f"analizadas {len(results)} de {len(request.scenes)} "
+                f"(lote GPU {len(scenes)})",
                 flush=True,
             )
     finally:
