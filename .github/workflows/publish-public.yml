@@ -13,6 +13,11 @@ on:
       - download_models.py
       - requirements.txt
       - requirements.motion.txt
+      - requirements.salad.txt
+      - Dockerfile.salad
+      - salad_assets.py
+      - salad_server.py
+      - start-salad.sh
       - .github/workflows/publish-public.yml
 
 permissions:
@@ -56,3 +61,15 @@ jobs:
             ghcr.io/cj90-hub/drakomedia-ltx23-video-public:motion-latest
           cache-from: type=gha,scope=gemma-motion
           cache-to: type=gha,mode=max,scope=gemma-motion
+
+      - name: Publish SaladCloud LTX worker
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.salad
+          push: true
+          tags: |
+            ghcr.io/cj90-hub/drakomedia-ltx23-video-public:salad-${{ github.sha }}
+            ghcr.io/cj90-hub/drakomedia-ltx23-video-public:salad-latest
+          cache-from: type=gha,scope=ltx-salad
+          cache-to: type=gha,mode=max,scope=ltx-salad

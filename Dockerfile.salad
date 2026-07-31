@@ -1,0 +1,24 @@
+FROM ghcr.io/cj90-hub/drakomedia-ltx23-video-public:video-e057e1364fb353aa10c7ac653625cc245b12f581
+
+ARG SALAD_QUEUE_WORKER_VERSION=v0.7.0
+ENV DRAKO_MODEL_CACHE=/workspace/model-cache \
+    SALAD_QUEUE_WORKER_LOG_LEVEL=info
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates \
+    && curl -fsSL \
+       "https://github.com/SaladTechnologies/salad-cloud-job-queue-worker/releases/download/${SALAD_QUEUE_WORKER_VERSION}/salad-http-job-queue-worker_x86_64.tar.gz" \
+       -o /tmp/salad-worker.tar.gz \
+    && tar -xzf /tmp/salad-worker.tar.gz -C /usr/local/bin \
+    && chmod 0755 /usr/local/bin/salad-http-job-queue-worker \
+    && rm -f /tmp/salad-worker.tar.gz \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY requirements.salad.txt ./
+RUN python -m pip install --no-cache-dir -r requirements.salad.txt
+
+COPY salad_assets.py salad_server.py start-salad.sh ./
+RUN chmod 0755 /app/start-salad.sh
+
+CMD ["/app/start-salad.sh"]
