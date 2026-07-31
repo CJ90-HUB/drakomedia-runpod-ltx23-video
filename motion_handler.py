@@ -8,6 +8,7 @@ import shutil
 import tempfile
 import threading
 import time
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -248,7 +249,10 @@ def _generate_results(
         tokenizer.padding_side = "left"
     inputs = processor(
         text=prompts,
-        images=images,
+        # Gemma 3 requires one image-list per text sample. A flat image list
+        # is interpreted as several images belonging to one prompt and raises
+        # a ValueError as soon as the batch contains more than one scene.
+        images=[[image] for image in images],
         padding=True,
         return_tensors="pt",
     ).to("cuda")
@@ -258,7 +262,7 @@ def _generate_results(
         with torch.inference_mode():
             generated = model.generate(
                 **inputs,
-                max_new_tokens=112,
+                max_new_tokens=144,
                 do_sample=False,
             )
         trimmed = generated[:, inputs["input_ids"].shape[1] :]
@@ -415,9 +419,11 @@ def handler(event: dict[str, Any]) -> dict[str, Any]:
             return _analyze_motion(request, Path(name))
     except Exception as exc:
         print(
-            f"DrakoMedia Cloud Motion · error {type(exc).__name__}",
+            "DrakoMedia Cloud Motion · "
+            f"error {type(exc).__name__}: {exc}",
             flush=True,
         )
+        traceback.print_exc()
         return public_error(exc)
 
 

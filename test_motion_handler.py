@@ -2,7 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import motion_handler
 
@@ -78,6 +78,63 @@ class MotionHandlerTests(unittest.TestCase):
         self.assertTrue(output["ok"])
         self.assertEqual(output["operation"], "prepare_model")
         self.assertEqual(output["model_bytes"], 14)
+
+    def test_batch_passes_one_image_list_per_prompt(self):
+        class FakeTensor:
+            shape = (2, 8)
+
+        class FakeInputs(dict):
+            def to(self, _device):
+                return self
+
+        processor = MagicMock()
+        processor.tokenizer = MagicMock()
+        processor.apply_chat_template.side_effect = ["prompt-1", "prompt-2"]
+        processor.return_value = FakeInputs(input_ids=FakeTensor())
+        processor.batch_decode.return_value = [
+            json.dumps(
+                {
+                    "motion_prompt": (
+                        "The camera remains steady while existing dust drifts "
+                        "gently across the visible rails and distant heat haze "
+                        "shimmers without changing the original composition."
+                    ),
+                    "confidence": 0.9,
+                    "risk": "low",
+                    "reason": "Safe visible environmental motion.",
+                }
+            ),
+            json.dumps(
+                {
+                    "motion_prompt": (
+                        "A slow forward camera glide follows the existing "
+                        "viaduct while sunlight shifts subtly across its "
+                        "concrete pillars and the surrounding savanna stays "
+                        "fully consistent."
+                    ),
+                    "confidence": 0.85,
+                    "risk": "medium",
+                    "reason": "Controlled infrastructure reveal.",
+                }
+            ),
+        ]
+        model = MagicMock()
+        model.generate.return_value = MagicMock()
+        model.generate.return_value.__getitem__.return_value = MagicMock()
+        images = [MagicMock(), MagicMock()]
+
+        results = motion_handler._generate_results(
+            model,
+            processor,
+            images,
+            ["context-1", "context-2"],
+        )
+
+        self.assertEqual(len(results), 2)
+        self.assertEqual(
+            processor.call_args.kwargs["images"],
+            [[images[0]], [images[1]]],
+        )
 
 
 if __name__ == "__main__":
