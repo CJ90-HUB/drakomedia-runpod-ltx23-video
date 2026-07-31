@@ -2,7 +2,8 @@ FROM ghcr.io/cj90-hub/drakomedia-ltx23-video-public:video-e057e1364fb353aa10c7ac
 
 ARG SALAD_QUEUE_WORKER_VERSION=v0.7.0
 ENV DRAKO_MODEL_CACHE=/workspace/model-cache \
-    SALAD_QUEUE_WORKER_LOG_LEVEL=info
+    SALAD_QUEUE_WORKER_LOG_LEVEL=info \
+    PYTHONUNBUFFERED=1
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl ca-certificates \
