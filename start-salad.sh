@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-uvicorn salad_server:app --host 127.0.0.1 --port 8080 &
+uvicorn salad_server:app --host 0.0.0.0 --port 8080 &
 api_pid=$!
 /usr/local/bin/salad-http-job-queue-worker &
 queue_pid=$!

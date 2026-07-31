@@ -28,3 +28,11 @@ def test_asset_path_rejects_traversal(path: str) -> None:
                 "size_bytes": 12,
             }
         )
+
+
+def test_salad_server_is_reachable_by_platform_probes() -> None:
+    start_script = (Path(__file__).parent / "start-salad.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "uvicorn salad_server:app --host 0.0.0.0 --port 8080" in start_script
+    assert "--host 127.0.0.1" not in start_script
