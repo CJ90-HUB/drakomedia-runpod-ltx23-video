@@ -2,7 +2,12 @@ from pathlib import Path
 
 import pytest
 
-from salad_assets import ALLOWED_ROOTS, _parse_asset
+from salad_assets import (
+    ALLOWED_ROOTS,
+    PARALLEL_ASSET_THRESHOLD_BYTES,
+    _parse_asset,
+    _range_specs,
+)
 
 
 def test_asset_path_is_scoped() -> None:
@@ -46,6 +51,22 @@ def test_motion_analysis_downloads_only_gemma() -> None:
 
 def test_all_model_roots_remain_explicitly_scoped() -> None:
     assert ALLOWED_ROOTS == {"gemma", "ltx"}
+
+
+def test_parallel_ranges_cover_asset_without_gaps() -> None:
+    specs = _range_specs(1_025, 256)
+    assert specs == (
+        (0, 255),
+        (256, 511),
+        (512, 767),
+        (768, 1_023),
+        (1_024, 1_024),
+    )
+    assert sum(end - start + 1 for start, end in specs) == 1_025
+
+
+def test_ltx_checkpoint_qualifies_for_parallel_download() -> None:
+    assert 29_531_884_062 >= PARALLEL_ASSET_THRESHOLD_BYTES
 
 
 def test_salad_worker_has_unbuffered_progress_logs() -> None:

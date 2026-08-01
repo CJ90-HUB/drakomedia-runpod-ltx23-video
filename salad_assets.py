@@ -16,6 +16,10 @@ import requests
 MAX_ASSET_BYTES = 40_000_000_000
 MAX_TOTAL_BYTES = 80_000_000_000
 ALLOWED_ROOTS = {"gemma", "ltx"}
+PARALLEL_ASSET_THRESHOLD_BYTES = 8_000_000_000
+RANGE_PART_BYTES = 512 * 1024 * 1024
+DEFAULT_RANGE_WORKERS = 4
+MAX_RANGE_WORKERS = 8
 _asset_lock = threading.Lock()
 _progress_lock = threading.Lock()
 _session = requests.Session()
@@ -98,7 +102,7 @@ def _parse_asset(value: Any) -> ModelAsset:
     return ModelAsset(relative, url, sha256, size)
 
 
-def _download(asset: ModelAsset, root: Path) -> None:
+def _download_serial(asset: ModelAsset, root: Path) -> None:
     destination = (root / asset.path).resolve()
     if root.resolve() not in destination.parents:
         raise ValueError("La ruta del modelo sale de la caché autorizada.")
@@ -133,7 +137,7 @@ def _download(asset: ModelAsset, root: Path) -> None:
             partial.unlink(missing_ok=True)
             offset = 0
             response.close()
-            return _download(asset, root)
+            return _download_serial(asset, root)
         response.raise_for_status()
         mode = "ab" if offset else "wb"
         written = offset
@@ -166,6 +170,187 @@ def _download(asset: ModelAsset, root: Path) -> None:
     with _progress_lock:
         _progress["completed_assets"] = int(_progress.get("completed_assets", 0)) + 1
     _log(f"asset_ready path={asset.path} bytes={asset.size_bytes}")
+
+
+def _range_specs(
+    size: int,
+    part_bytes: int = RANGE_PART_BYTES,
+) -> tuple[tuple[int, int], ...]:
+    if size <= 0 or part_bytes <= 0:
+        raise ValueError("El tamano del rango no es valido.")
+    return tuple(
+        (start, min(size - 1, start + part_bytes - 1))
+        for start in range(0, size, part_bytes)
+    )
+
+
+def _range_workers() -> int:
+    try:
+        configured = int(
+            os.environ.get("DRAKO_MODEL_RANGE_WORKERS", DEFAULT_RANGE_WORKERS)
+        )
+    except (TypeError, ValueError):
+        configured = DEFAULT_RANGE_WORKERS
+    return max(1, min(MAX_RANGE_WORKERS, configured))
+
+
+def _download_parallel(asset: ModelAsset, root: Path) -> None:
+    destination = (root / asset.path).resolve()
+    if root.resolve() not in destination.parents:
+        raise ValueError("La ruta del modelo sale de la cache autorizada.")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if (
+        destination.is_file()
+        and destination.stat().st_size == asset.size_bytes
+        and _sha256(destination) == asset.sha256
+    ):
+        for stale in destination.parent.glob(f"{destination.name}.part.range-*"):
+            stale.unlink(missing_ok=True)
+        _update_asset_progress(asset, asset.size_bytes)
+        _log(f"asset_cached path={asset.path} bytes={asset.size_bytes}")
+        return
+
+    partial = destination.with_suffix(destination.suffix + ".part")
+    partial.unlink(missing_ok=True)
+    specs = _range_specs(asset.size_bytes)
+    range_paths = tuple(
+        partial.with_name(f"{partial.name}.range-{index:04d}")
+        for index in range(len(specs))
+    )
+    written_by_range: dict[int, int] = {}
+    for index, ((start, end), path) in enumerate(zip(specs, range_paths)):
+        expected = end - start + 1
+        if path.is_file() and path.stat().st_size == expected:
+            written_by_range[index] = expected
+        else:
+            path.unlink(missing_ok=True)
+            written_by_range[index] = 0
+
+    progress_guard = threading.Lock()
+    initial = sum(written_by_range.values())
+    _update_asset_progress(asset, initial)
+    workers = min(_range_workers(), len(specs))
+    _log(
+        f"asset_parallel_start path={asset.path} ranges={len(specs)} "
+        f"workers={workers} resumed={initial} bytes={asset.size_bytes}"
+    )
+    last_reported = initial
+    last_report_time = time.monotonic()
+
+    def download_range(index: int) -> None:
+        nonlocal last_reported, last_report_time
+        start, end = specs[index]
+        destination_part = range_paths[index]
+        expected = end - start + 1
+        if written_by_range[index] == expected:
+            return
+        temporary = destination_part.with_suffix(destination_part.suffix + ".tmp")
+        temporary.unlink(missing_ok=True)
+        written = 0
+        with requests.get(
+            asset.url,
+            headers={"Range": f"bytes={start}-{end}"},
+            stream=True,
+            timeout=(20, 900),
+            allow_redirects=False,
+        ) as response:
+            if response.status_code != 206:
+                raise ValueError("El servidor de modelos no acepto rangos HTTPS.")
+            content_range = response.headers.get("Content-Range", "").lower()
+            if not content_range.startswith(f"bytes {start}-{end}/"):
+                raise ValueError("El servidor devolvio un rango inesperado.")
+            with temporary.open("wb") as output:
+                for chunk in response.iter_content(8 * 1024 * 1024):
+                    if not chunk:
+                        continue
+                    written += len(chunk)
+                    if written > expected:
+                        raise ValueError("Un rango supera su tamano declarado.")
+                    output.write(chunk)
+                    report = 0
+                    with progress_guard:
+                        written_by_range[index] = written
+                        total_written = sum(written_by_range.values())
+                        now = time.monotonic()
+                        if (
+                            total_written - last_reported >= 256 * 1024 * 1024
+                            or now - last_report_time >= 15
+                        ):
+                            last_reported = total_written
+                            last_report_time = now
+                            report = total_written
+                    if report:
+                        _update_asset_progress(asset, report)
+                        _log(
+                            f"asset_download_progress path={asset.path} "
+                            f"bytes={report} total={asset.size_bytes}"
+                        )
+        if written != expected:
+            temporary.unlink(missing_ok=True)
+            raise ValueError("La descarga de un rango quedo incompleta.")
+        os.replace(temporary, destination_part)
+        with progress_guard:
+            written_by_range[index] = expected
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        list(pool.map(download_range, range(len(specs))))
+
+    if sum(path.stat().st_size for path in range_paths) != asset.size_bytes:
+        raise ValueError("Los rangos no completan el modelo.")
+    _set_progress(phase="assembling")
+    _log(f"asset_assemble_start path={asset.path} ranges={len(range_paths)}")
+    assembled = 0
+    last_assembled = 0
+    last_assemble_time = time.monotonic()
+    with partial.open("wb") as output:
+        for range_path in range_paths:
+            with range_path.open("rb") as source:
+                while chunk := source.read(8 * 1024 * 1024):
+                    output.write(chunk)
+                    assembled += len(chunk)
+                    now = time.monotonic()
+                    if (
+                        assembled - last_assembled >= 256 * 1024 * 1024
+                        or now - last_assemble_time >= 15
+                    ):
+                        _log(
+                            f"asset_assemble_progress path={asset.path} "
+                            f"bytes={assembled} total={asset.size_bytes}"
+                        )
+                        last_assembled = assembled
+                        last_assemble_time = now
+    if assembled != asset.size_bytes:
+        partial.unlink(missing_ok=True)
+        raise ValueError("El ensamblado paralelo quedo incompleto.")
+
+    _set_progress(phase="verifying")
+    _log(f"asset_verify_start path={asset.path} bytes={asset.size_bytes}")
+    if _sha256(partial) != asset.sha256:
+        partial.unlink(missing_ok=True)
+        for range_path in range_paths:
+            range_path.unlink(missing_ok=True)
+        raise ValueError("La huella del modelo descargado no coincide.")
+    os.replace(partial, destination)
+    for range_path in range_paths:
+        range_path.unlink(missing_ok=True)
+    _update_asset_progress(asset, asset.size_bytes)
+    with _progress_lock:
+        _progress["completed_assets"] = int(_progress.get("completed_assets", 0)) + 1
+    _log(f"asset_ready path={asset.path} bytes={asset.size_bytes}")
+
+
+def _download(asset: ModelAsset, root: Path) -> None:
+    destination = (root / asset.path).resolve()
+    partial = destination.with_suffix(destination.suffix + ".part")
+    if (
+        asset.size_bytes >= PARALLEL_ASSET_THRESHOLD_BYTES
+        and not partial.is_file()
+    ):
+        return _download_parallel(asset, root)
+    result = _download_serial(asset, root)
+    for stale in destination.parent.glob(f"{destination.name}.part.range-*"):
+        stale.unlink(missing_ok=True)
+    return result
 
 
 def ensure_model_assets(
