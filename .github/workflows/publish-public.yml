@@ -8,8 +8,14 @@ on:
       - Dockerfile
       - Dockerfile.motion
       - handler.py
+      - video_contract.py
+      - video_only_distilled.py
       - motion_handler.py
       - contract.py
+      - test_video_contract.py
+      - test_video_persistence.py
+      - test_video_runtime_contract.py
+      - test_video_only_source.py
       - download_models.py
       - requirements.txt
       - requirements.motion.txt

@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import gc
 import hashlib
-import json
+import importlib.metadata
 import os
-import re
 import tempfile
 import threading
 import time
@@ -12,14 +11,12 @@ from pathlib import Path
 from typing import Any
 
 import requests
-from PIL import Image
 
-from contract import (
+from video_contract import (
+    GenerationStageError,
     MAX_IMAGE_BYTES,
     MAX_OUTPUT_BYTES,
-    MotionAnalysisRequest,
     VideoRequest,
-    parse_motion_request,
     parse_request,
     public_error,
 )
@@ -38,29 +35,6 @@ _pipeline_load_seconds = 0.0
 _pipeline_generation_count = 0
 _pipeline_lock = threading.Lock()
 _generation_lock = threading.Lock()
-
-MOTION_SYSTEM_PROMPT = """
-You are a conservative motion director for LTX-2.3 image-to-video.
-Inspect the actual supplied image and the scene context. Return ONLY one
-compact JSON object:
-{"motion_prompt":"...","confidence":0.0,"risk":"low|medium|high","reason":"..."}
-
-motion_prompt must contain 20-55 English words and describe one continuous
-documentary shot. State one restrained camera behavior and only physically
-plausible motion of elements visibly present in the image. Never introduce,
-remove, duplicate or transform subjects or objects. Never request a scene
-transition, a hidden area, a new action, readable text, fast camera motion,
-camera roll, aggressive zoom, morphing or complex choreography. Preserve
-identity, subject count, geometry and composition. For people in close or
-medium shots, prefer a locked camera with breathing, blinking and tiny
-existing gestures. confidence measures how certain you are that the motion
-matches visible content. risk is high when faces, hands, dense machinery,
-text or ambiguous geometry make animation fragile. reason must be a short
-Spanish explanation. Motion level: safe means locked or nearly imperceptible;
-natural means one subtle documentary camera move and plausible visible
-motion; dynamic means one visible but controlled camera move and stronger
-existing environmental motion, without inventing actions or elements.
-""".strip()
 
 
 def _locate_checkpoint() -> Path:
@@ -120,6 +94,23 @@ def _locate_gemma() -> Path:
     )
 
 
+def _validate_runtime_dependencies() -> None:
+    # The immutable, working production image is the compatibility authority.
+    # Import the exact module that exposed the original broken dependency pair.
+    importlib.import_module("transformers.utils.hub")
+
+    actual = {
+        package: importlib.metadata.version(package)
+        for package in ("transformers", "huggingface-hub")
+    }
+    print(
+        "DrakoMedia LTX-2.3 · runtime verificado · "
+        f"transformers={actual['transformers']} · "
+        f"huggingface-hub={actual['huggingface-hub']}",
+        flush=True,
+    )
+
+
 def _download_image(url: str, destination: Path) -> None:
     with _session.get(
         url,
@@ -172,6 +163,15 @@ def _upload(url: str, source: Path) -> str:
     return digest
 
 
+def _stage(stage: str, action: Any) -> Any:
+    try:
+        return action()
+    except GenerationStageError:
+        raise
+    except Exception as exc:
+        raise GenerationStageError(stage, exc) from exc
+
+
 def _load_pipeline() -> Any:
     global _pipeline
     global _pipeline_load_seconds
@@ -181,25 +181,46 @@ def _load_pipeline() -> Any:
     with _pipeline_lock:
         if _pipeline is not None:
             return _pipeline
-
-        from ltx_pipelines.distilled import DistilledPipeline
-        from ltx_pipelines.utils.quantization_factory import QuantizationKind
-
-        checkpoint = str(_locate_checkpoint())
-        started = time.monotonic()
-        print(
-            "DrakoMedia LTX-2.3 · cargando el modelo persistente una sola vez",
-            flush=True,
-        )
-        _pipeline = DistilledPipeline(
-            distilled_checkpoint_path=checkpoint,
-            spatial_upsampler_path=SPATIAL_UPSAMPLER,
-            gemma_root=str(_locate_gemma()),
-            loras=(),
-            quantization=QuantizationKind.FP8_SCALED_MM.to_policy(
-                checkpoint_path=checkpoint
-            ),
-        )
+        try:
+            _stage("runtime", _validate_runtime_dependencies)
+            quantization_module = _stage(
+                "pipeline_import",
+                lambda: importlib.import_module(
+                    "ltx_pipelines.utils.quantization_factory"
+                ),
+            )
+            pipeline_module = _stage(
+                "pipeline_import",
+                lambda: importlib.import_module("video_only_distilled"),
+            )
+            checkpoint = str(_stage("checkpoint", _locate_checkpoint))
+            gemma_root = str(_stage("gemma", _locate_gemma))
+            started = time.monotonic()
+            print(
+                "DrakoMedia LTX-2.3 · "
+                "cargando el modelo persistente una sola vez",
+                flush=True,
+            )
+            _pipeline = _stage(
+                "model_load",
+                lambda: pipeline_module.VideoOnlyDistilledPipeline(
+                    distilled_checkpoint_path=checkpoint,
+                    spatial_upsampler_path=SPATIAL_UPSAMPLER,
+                    gemma_root=gemma_root,
+                    loras=(),
+                    quantization=(
+                        quantization_module.QuantizationKind.FP8_SCALED_MM
+                        .to_policy(checkpoint_path=checkpoint)
+                    ),
+                ),
+            )
+        except Exception as exc:
+            print(
+                "DrakoMedia LTX-2.3 · fallo de carga · "
+                f"{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            raise
         _pipeline_load_seconds = time.monotonic() - started
         print(
             "DrakoMedia LTX-2.3 · modelo persistente preparado en "
@@ -209,195 +230,6 @@ def _load_pipeline() -> Any:
         return _pipeline
 
 
-def _unload_pipeline() -> None:
-    global _pipeline
-    if _pipeline is None:
-        return
-    pipeline = _pipeline
-    _pipeline = None
-    del pipeline
-    gc.collect()
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except Exception:
-        pass
-
-
-def _extract_motion_object(text: str) -> dict[str, Any]:
-    cleaned = re.sub(
-        r"^```(?:json)?\s*|\s*```$",
-        "",
-        text.strip(),
-        flags=re.I | re.S,
-    )
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start < 0 or end <= start:
-        raise ValueError("El director visual no devolvió JSON.")
-    return json.loads(cleaned[start : end + 1])
-
-
-def _validate_motion(value: dict[str, Any]) -> dict[str, Any]:
-    prompt = " ".join(str(value.get("motion_prompt", "")).split())
-    words = prompt.split()
-    forbidden = (
-        "new person",
-        "new people",
-        "new object",
-        "scene transition",
-        "camera roll",
-        "fast pan",
-        "fast tilt",
-        "aggressive zoom",
-        "morph",
-        "transform into",
-    )
-    if (
-        len(words) < 12
-        or len(words) > 80
-        or any(term in prompt.lower() for term in forbidden)
-    ):
-        raise ValueError("El prompt de movimiento no superó la validación.")
-    confidence = max(
-        0.0,
-        min(1.0, float(value.get("confidence", 0.0))),
-    )
-    risk = str(value.get("risk", "high")).strip().lower()
-    if risk not in {"low", "medium", "high"}:
-        risk = "high"
-    return {
-        "motion_prompt": prompt,
-        "confidence": confidence,
-        "risk": risk,
-        "reason": " ".join(
-            str(value.get("reason", "")).split()
-        )[:240],
-    }
-
-
-def _motion_context(scene: Any) -> str:
-    return (
-        f"{MOTION_SYSTEM_PROMPT}\n\n"
-        f"Scene title: {scene.title}\n"
-        f"Narration: {scene.narration}\n"
-        f"Image prompt: {scene.image_prompt}\n"
-        f"Visual intention: {scene.visual_intent}\n"
-        f"Motion level: {scene.level}"
-    )
-
-
-def _prepare_motion_image(path: Path) -> Image.Image:
-    with Image.open(path) as source:
-        image = source.convert("RGB")
-    image.thumbnail((768, 768), Image.Resampling.LANCZOS)
-    return image
-
-
-def _analyze_motion(
-    request: MotionAnalysisRequest,
-    folder: Path,
-) -> dict[str, Any]:
-    import torch
-    from transformers import AutoModelForImageTextToText, AutoProcessor
-
-    _unload_pipeline()
-    model_root = str(_locate_gemma())
-    print(
-        "DrakoMedia Cloud Motion · cargando el director visual Gemma 3",
-        flush=True,
-    )
-    started = time.monotonic()
-    processor = AutoProcessor.from_pretrained(
-        model_root,
-        local_files_only=True,
-    )
-    model = AutoModelForImageTextToText.from_pretrained(
-        model_root,
-        torch_dtype=torch.bfloat16,
-        local_files_only=True,
-        low_cpu_mem_usage=True,
-    ).to("cuda").eval()
-    load_seconds = time.monotonic() - started
-    results: list[dict[str, Any]] = []
-    analysis_started = time.monotonic()
-    try:
-        for index, scene in enumerate(request.scenes, start=1):
-            image_path = folder / f"motion-{index:03d}.image"
-            _download_image(scene.image_url, image_path)
-            image = _prepare_motion_image(image_path)
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": image},
-                        {"type": "text", "text": _motion_context(scene)},
-                    ],
-                }
-            ]
-            prompt = processor.apply_chat_template(
-                messages,
-                add_generation_prompt=True,
-                tokenize=False,
-            )
-            inputs = processor(
-                text=[prompt],
-                images=[image],
-                return_tensors="pt",
-            ).to("cuda")
-            with torch.inference_mode():
-                generated = model.generate(
-                    **inputs,
-                    max_new_tokens=180,
-                    do_sample=False,
-                )
-            trimmed = generated[:, inputs["input_ids"].shape[-1] :]
-            raw = processor.batch_decode(
-                trimmed,
-                skip_special_tokens=True,
-                clean_up_tokenization_spaces=False,
-            )[0]
-            result = _validate_motion(_extract_motion_object(raw))
-            result.update(
-                {
-                    "scene_id": scene.scene_id,
-                    "analysis_signature": scene.analysis_signature,
-                    "ok": True,
-                }
-            )
-            results.append(result)
-            print(
-                "DrakoMedia Cloud Motion · "
-                f"analizada {index} de {len(request.scenes)}",
-                flush=True,
-            )
-            del inputs
-            del generated
-            del trimmed
-            image.close()
-            image_path.unlink(missing_ok=True)
-    finally:
-        del model
-        del processor
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    return {
-        "ok": True,
-        "request_id": request.request_id,
-        "operation": "analyze_motion",
-        "results": results,
-        "director_engine": "gemma-3-12b-vision",
-        "director_mode": "cloud-batch",
-        "model_load_ms": round(load_seconds * 1_000),
-        "analysis_ms": round(
-            (time.monotonic() - analysis_started) * 1_000
-        ),
-        "scene_count": len(results),
-    }
 def _run_pipeline(request: VideoRequest, folder: Path) -> tuple[Path, float, bool]:
     global _pipeline_generation_count
 
@@ -407,6 +239,10 @@ def _run_pipeline(request: VideoRequest, folder: Path) -> tuple[Path, float, boo
         get_video_chunks_number,
     )
     from ltx_pipelines.utils.args import ImageConditioningInput
+    from ltx_pipelines.utils.constants import (
+        DISTILLED_SIGMAS,
+        STAGE_2_DISTILLED_SIGMAS,
+    )
     from ltx_pipelines.utils.media_io import encode_video
 
     reused = _pipeline is not None
@@ -429,7 +265,13 @@ def _run_pipeline(request: VideoRequest, folder: Path) -> tuple[Path, float, boo
     with _generation_lock, torch.inference_mode():
         tiling = TilingConfig.default()
         video_chunks = get_video_chunks_number(request.frames, tiling)
-        video, audio = pipeline(
+        pipeline_args: dict[str, Any] = {}
+        if request.profile == "ultra-cheap-plus":
+            pipeline_args = {
+                "stage_1_sigmas": DISTILLED_SIGMAS[[0, 4, 6, 7, 8]],
+                "stage_2_sigmas": STAGE_2_DISTILLED_SIGMAS[[0, 2, 3]],
+            }
+        video = pipeline(
             prompt=request.prompt,
             seed=request.seed,
             height=request.height,
@@ -439,16 +281,22 @@ def _run_pipeline(request: VideoRequest, folder: Path) -> tuple[Path, float, boo
             images=images,
             tiling_config=tiling,
             enhance_prompt=False,
+            **pipeline_args,
         )
         encode_video(
             video=video,
             fps=request.fps,
-            audio=audio,
+            audio=None,
             output_path=str(output),
             video_chunks_number=video_chunks,
+            crf=22 if request.profile == "ultra-cheap-plus" else 19,
+            preset=(
+                "ultrafast"
+                if request.profile == "ultra-cheap-plus"
+                else "veryfast"
+            ),
         )
         del video
-        del audio
 
     generation_seconds = time.monotonic() - started
     _pipeline_generation_count += 1
@@ -468,6 +316,7 @@ def _generate(request: VideoRequest, folder: Path) -> dict[str, Any]:
     sha256 = _upload(request.upload_url, output)
     return {
         "ok": True,
+        "profile": request.profile,
         "request_id": request.request_id,
         "object_key": request.object_key,
         "sha256": sha256,
@@ -480,7 +329,7 @@ def _generate(request: VideoRequest, folder: Path) -> dict[str, Any]:
             request.frames / request.fps * 1_000
         ),
         "seed": request.seed,
-        "engine": "ltx-2.3-distilled-fp8",
+        "engine": "ltx-2.3-distilled-fp8-video-only",
         "pipeline_mode": "persistent",
         "pipeline_reused": pipeline_reused,
         "pipeline_load_ms": round(_pipeline_load_seconds * 1_000),
@@ -493,31 +342,11 @@ def _generate(request: VideoRequest, folder: Path) -> dict[str, Any]:
 
 def handler(event: dict[str, Any]) -> dict[str, Any]:
     try:
-        payload = event.get("input") if isinstance(event, dict) else None
-        operation = (
-            payload.get("operation", "generate_video")
-            if isinstance(payload, dict)
-            else "generate_video"
-        )
-        if operation == "analyze_motion":
-            motion_request = parse_motion_request(event)
-            print(
-                "DrakoMedia Cloud Motion · "
-                f"solicitud {motion_request.request_id} · "
-                f"{len(motion_request.scenes)} imágenes",
-                flush=True,
-            )
-            with tempfile.TemporaryDirectory(
-                prefix="drakomedia-motion-"
-            ) as name:
-                return _analyze_motion(
-                    motion_request,
-                    Path(name),
-                )
         request = parse_request(event)
         print(
             "DrakoMedia LTX-2.3 · "
             f"solicitud {request.request_id} · "
+            f"{request.profile} · "
             f"{request.width}x{request.height} · "
             f"{request.frames} frames",
             flush=True,
@@ -528,7 +357,8 @@ def handler(event: dict[str, Any]) -> dict[str, Any]:
             return _generate(request, Path(name))
     except Exception as exc:
         print(
-            f"DrakoMedia LTX-2.3 · error {type(exc).__name__}",
+            "DrakoMedia LTX-2.3 · error "
+            f"{type(exc).__name__}: {exc}",
             flush=True,
         )
         return public_error(exc)
